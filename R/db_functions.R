@@ -3,24 +3,24 @@
 #' This function can read delimited text data, in the format used by the Bureau
 #' of Meteorology, from an individual weather station file or a directory or zip
 #' file containing one or more such files, stations in CSV format, and import
-#' them into a SQLite database.
-#'
-#' In the case of the input data source being a directory or zip file, weather
-#' station files are identified by searching for names that include 'Data'
-#' followed by digits and underscores, with the file extension '.txt'. Any
-#' input records already present in the database are silently ignored.
+#' them into a SQLite database. In the case of the input data source being a
+#' directory or zip file, weather station files are identified by searching for
+#' names that include 'Data' followed by digits and underscores, with the file
+#' extension '.txt'. Any input records already present in the database are
+#' silently ignored. Note that fire-related variables (KBDI, drought factor and
+#' FFDI) are \strong{not} calculated for the new records. call the function
+#' \code{bom_db_update_fire} to do this.
 #'
 #' @param db A database connection pool object as returned by
 #'   \code{\link{bom_db_open}} or \code{\link{bom_db_create}}.
 #'
 #' @param datapath Character path to one of the following: an individual weather
 #'   station data file in CSV format; a directory containing one or more data
-#'   files; or a zip file containing one or more such files. Zip files are
-#'   assumed to have a '.zip' extension.
+#'   files; or a zip file containing one or more such files. If a zip file
+#'   (identified by a '.zip' extension) the path should be to a single file.
 #'
 #' @param stations Either NULL (default) to import data for all stations, or a
 #'   character vector of station identifiers. Ignored if \code{datapath} is a
-#'   single file.
 #'
 #' @param allow.missing If TRUE (default) and specific stations were requested,
 #'   the function will silently ignore any that are missing in the directory or
@@ -31,7 +31,7 @@
 #'   successfully read, not necessarily that new records were added to the
 #'   database.
 #'
-#' @export
+#' @seealso \code{\link{bom_db_update_fire}}
 #'
 #' @examples
 #' \dontrun{
@@ -51,6 +51,8 @@
 #' # Do other things, then at end of session...
 #' bom_db_close(DB)
 #' }
+#'
+#' @export
 #'
 bom_db_import <- function(db,
                           datapath,
@@ -85,8 +87,14 @@ bom_db_import <- function(db,
 #
 .sql_import <- function(dat) {
   tblname <- attributes(dat)$datatype
+
+  varnames <- paste(colnames(dat), collapse = ", ")
   params <- paste(paste0(":", colnames(dat)), collapse = ", ")
-  paste0("INSERT OR IGNORE INTO ", tblname, " VALUES (", params, ")")
+
+  cmd <- glue::glue("INSERT OR IGNORE INTO {tblname}
+                    ({varnames})
+                    VALUES ({params});")
+  cmd
 }
 
 
@@ -174,6 +182,24 @@ bom_db_import <- function(db,
   else {
     dat <- .map_fields(dat)
 
+    # Ensure we have integer or numeric data in each column
+    # (some BOM data sets have empty values as character strings)
+    coltypes <- attributes(dat)$coltypes
+    stopifnot(length(coltypes) == ncol(dat))
+
+    suppressWarnings(
+      for (i in 1:ncol(dat)) {
+        if (coltypes[i] == "integer") {
+          dat[[i]] <- as.integer(dat[[i]])
+        } else if (coltypes[i] == "numeric") {
+          dat[[i]] <- as.numeric(dat[[i]])
+        } else {
+          # This would be a package programming error
+          stop("Unknown column type in COLUMN_LOOKUP: ", coltypes[i])
+        }
+      }
+    )
+
     rs <- DBI::dbSendStatement(conn, .sql_import(dat))
     DBI::dbBind(rs, params = dat)
     DBI::dbClearResult(rs)
@@ -185,10 +211,12 @@ bom_db_import <- function(db,
 
 #' Create a new database for weather data
 #'
-#' This function creates a new database with tables for synoptic and AWS data.
-#' SQLite databases consist of a single file which holds all tables. The file
-#' extension is arbitrary and may be omitted, but using '.db' or '.sqlite' is
-#' recommended for sanity.
+#' This function creates a new database with tables: 'Synoptic' for synoptic
+#' data records; 'AWS' for automatic weather station data records; and
+#' 'Stations' with details of station names and locations. SQLite databases
+#' consist of a single file which holds all tables. The file extension is
+#' arbitrary and may be omitted, but using '.db' or '.sqlite' is recommended for
+#' sanity.
 #'
 #' @param dbpath A character path to the new database file. An error is thrown
 #'   if the file already exists.
@@ -203,7 +231,7 @@ bom_db_import <- function(db,
 #' @examples
 #' \dontrun{
 #' # Create a new database file with the required weather data tables
-#' # for AWS and synoptic data
+#' # for AWS and synoptic data and weather station metadata
 #' DB <- bom_db_create("c:/foo/bar/weather.db")
 #'
 #' # Do things with it
@@ -218,15 +246,13 @@ bom_db_create <- function(dbpath) {
 
   DB <- pool::dbPool(RSQLite::SQLite(), dbname = dbpath, flags = RSQLite::SQLITE_RWC)
 
-  conn <- pool::poolCheckout(DB)
+  pool::poolWithTransaction(DB, function(conn) {
+    DBI::dbExecute(conn, SQL_CREATE_TABLES$create_synoptic_table)
+    DBI::dbExecute(conn, SQL_CREATE_TABLES$create_aws_table)
+    DBI::dbExecute(conn, SQL_CREATE_TABLES$create_stations_table)
 
-  res <- DBI::dbSendQuery(conn, .BOM_SQL$create_synoptic_table)
-  DBI::dbClearResult(res)
-
-  res <- DBI::dbSendQuery(conn, .BOM_SQL$create_aws_table)
-  DBI::dbClearResult(res)
-
-  pool::poolReturn(conn)
+    DBI::dbWriteTable(conn, "Stations", CERMBweather::STATION_METADATA, append = TRUE)
+  })
 
   DB
 }
@@ -234,8 +260,8 @@ bom_db_create <- function(dbpath) {
 #' Open a connection to an existing database
 #'
 #' This function connects an existing database and checks that it contains the
-#' required tables for synoptic and AWS data. By default, it returns a read-only
-#' connection.
+#' required tables for synoptic and AWS data. If a 'Stations' table is not present
+#' in the database, it is added. By default, a read-only connection is returned.
 #'
 #' @param dbpath A character path to an existing database file.
 #'
@@ -268,12 +294,15 @@ bom_db_open <- function(dbpath, readonly = TRUE) {
 
   if (dir.exists(dbpath)) stop("Expected a file not a directory: ", dbpath)
 
-  if (readonly) flags <- RSQLite::SQLITE_RO
-  else flags <- RSQLite::SQLITE_RW
-
-  DB <- pool::dbPool(RSQLite::SQLite(), dbname = dbpath, flags = flags)
-
+  # Initially open as read-write for checking tables
+  DB <- pool::dbPool(RSQLite::SQLite(), dbname = dbpath, flags = RSQLite::SQLITE_RW)
   .ensure_connection(DB)
+  .ensure_stations_table(DB)
+
+  if (readonly) {
+    bom_db_close(DB)
+    DB <- pool::dbPool(RSQLite::SQLite(), dbname = dbpath, flags = RSQLite::SQLITE_RO)
+  }
 
   DB
 }
@@ -532,6 +561,108 @@ bom_db_summary <- function(db, by = c("total", "station"), approx = TRUE) {
   else res <- res[, c("table", "nrecs")]
 
   res
+}
+
+
+#' Check that records in a data set form an uninterrupted time series
+#'
+#' Given a data frame of daily or sub-daily records for one or more weather
+#' stations, this function checks whether there are any gaps in the time series.
+#' A gap is defined as one or more missing days. The input data records can be
+#' in any order. It is primarily a helper function, called by other functions in
+#' the package that require an uninterrupted time series, but can also be used
+#' directly.
+#'
+#' @param dat A data frame with date columns (integer year, month and day),
+#'   optional time columns (integer hour and minute) and possibly other
+#'   variables. Normally a column of integer station identifiers will be present
+#'   but this is optional. If missing, it will be assumed that all records pertain to
+#'   a single weather station.
+#'
+#' @param daily If \code{TRUE}, expect only one record per day and return a
+#'   failed check result if this is not the case. Note that a value must be
+#'   supplied for this argument.
+#'
+#' @return A nested list with one element per station, where each element is a
+#'   list consisting of:
+#'   \describe{
+#'     \item{station}{Integer station identifier (Set to -1 if no station
+#'       column is provided).}
+#'     \item{ok}{Logical value indicating success or failure of checks.}
+#'     \item{gaps}{Dates (as Date objects) before which each gap in the time
+#'       series occurs.}
+#'   }
+#'
+#' @export
+#'
+bom_db_check_datetimes <- function(dat, daily) {
+  if (missing(daily)) stop("Argument 'daily' (logical) must be provided")
+
+  colnames(dat) <- tolower(colnames(dat))
+  if (!all(c("year", "month", "day") %in% colnames(dat))) {
+    stop("Columns year, month, day are required")
+  }
+
+  HasStation <- ("station" %in% colnames(dat))
+
+  if (HasStation) {
+    if (anyNA(dat$station)) stop("station column should not contain missing values")
+  } else {
+    dat$station <- -1
+  }
+
+  # ungroup just in case
+  dat <- dplyr::ungroup(dat)
+
+  # Vars to use for ordering records
+  ovars <- c("year", "month", "day")
+  if ("hour" %in% colnames(dat)) ovars <- c(ovars, "hour")
+  if ("minute" %in% colnames(dat)) ovars <- c(ovars, "minute")
+
+  # Run check for each station
+  checks <- lapply(unique(dat$station), function(stn) {
+    dat.stn <- dat %>% dplyr::filter(station == stn)
+
+    # Default check value
+    res <- list(station = stn,
+                ok = TRUE,
+                err = NULL,
+                gaps = NULL)
+
+    # If less than two records, gaps and order do not apply
+    if (nrow(dat.stn) < 2) {
+      return(res)
+    }
+
+    dat.stn <- dat.stn %>%
+      dplyr::mutate(date = .ymd_to_date(year, month, day))
+
+    # If only daily records are expected, check and return
+    # early if that is not the case
+    if (daily && dplyr::n_distinct(dat.stn$date) < nrow(dat.stn)) {
+      res$ok <- FALSE
+      res$err <- "Expected only one record per day"
+      return(res)
+    }
+
+    dat.stn <- dplyr::arrange_at(dat.stn, ovars)
+
+    # Check that there are no missing days
+    dat.stn <- dat.stn %>%
+      dplyr::mutate(diff = as.integer(date - dplyr::lag(date)))
+
+    # First record is ignored because there is no prior date
+    okdiffs <- c(TRUE, dat.stn$diff[-1] %in% 0:1)
+    if (any(!okdiffs)) {
+      res$ok <- FALSE
+      res$err <- "Gap(s) in time series"
+      res$gaps <- dat.stn$date[!okdiffs]
+    }
+
+    res
+  })
+
+  checks
 }
 
 
